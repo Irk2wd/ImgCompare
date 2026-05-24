@@ -35,10 +35,29 @@ from tabulate import tabulate
 # Suppress torchvision deprecation warnings originating from lpips internals.
 warnings.filterwarnings("ignore", category=UserWarning, module="torchvision")
 
+CUDA_CLEANUP_ERRORS = (
+    RuntimeError,
+    torch.OutOfMemoryError,
+    getattr(torch, "AcceleratorError", RuntimeError),
+)
+
 
 # ---------------------------------------------------------------------------
 # Image loading
 # ---------------------------------------------------------------------------
+
+def safe_clear_cuda_cache() -> None:
+    """Best-effort CUDA cleanup after metric execution or OOM.
+
+    CUDA can surface OOM asynchronously, so synchronize/empty_cache may raise
+    during cleanup and would otherwise hide the original exception.
+    """
+    if not torch.cuda.is_available():
+        return
+    with contextlib.suppress(*CUDA_CLEANUP_ERRORS):
+        torch.cuda.synchronize()
+    with contextlib.suppress(*CUDA_CLEANUP_ERRORS):
+        torch.cuda.empty_cache()
 
 def load_image(path: str) -> np.ndarray:
     """Load an image as float32 RGB [H, W, 3] in its native HDR range.
@@ -146,23 +165,25 @@ def compute_metrics(ref, tgt, lpips_model, device, lpips_lock=None):
 
     try:
         with _ctx:
-            ref_t = ref_cpu.to(device)
-            tgt_t = tgt_cpu.to(device)
+            try:
+                ref_t = ref_cpu.to(device)
+                tgt_t = tgt_cpu.to(device)
 
-            psnr_val = _psnr_pt(ref_t, tgt_t)
-            ssim_val = _ssim_pt(ref_t, tgt_t)
-            with torch.no_grad():
-                lpips_val = lpips_model(ref_t, tgt_t).item()
+                psnr_val = _psnr_pt(ref_t, tgt_t)
+                ssim_val = _ssim_pt(ref_t, tgt_t)
+                with torch.no_grad():
+                    lpips_val = lpips_model(ref_t, tgt_t).item()
 
-        return {"PSNR": psnr_val, "SSIM": ssim_val, "LPIPS": lpips_val}
+                return {"PSNR": psnr_val, "SSIM": ssim_val, "LPIPS": lpips_val}
+            finally:
+                if ref_t is not None:
+                    del ref_t
+                if tgt_t is not None:
+                    del tgt_t
+                if device.type == "cuda":
+                    safe_clear_cuda_cache()
     finally:
         del ref_cpu, tgt_cpu
-        if ref_t is not None:
-            del ref_t
-        if tgt_t is not None:
-            del tgt_t
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
 
 
 # ---------------------------------------------------------------------------

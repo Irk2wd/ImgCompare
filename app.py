@@ -24,7 +24,7 @@ import pandas as pd
 import torch
 import yaml
 
-from compare import compute_metrics, load_image
+from compare import compute_metrics, load_image, safe_clear_cuda_cache
 
 
 # ─────────────────────────────────────────────────────────────
@@ -455,7 +455,7 @@ class App(tk.Tk):
                         return ("warn", msg)
 
                     gpu_fallback.set()
-                    torch.cuda.empty_cache()
+                    safe_clear_cuda_cache()
                     warn_msg = (
                         f"CUDA OOM on {tgt_name}; retrying this and remaining pairs on CPU"
                     )
