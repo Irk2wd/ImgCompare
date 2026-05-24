@@ -13,6 +13,7 @@ import contextlib
 import os
 import sys
 import threading
+import traceback
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -25,8 +26,8 @@ import lpips
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 import yaml
-from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 from tabulate import tabulate
 
 # Suppress torchvision deprecation warnings originating from lpips internals.
@@ -65,59 +66,89 @@ def load_image(path: str) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# Metric helpers — PyTorch implementations matching the 3DGS reference
+# ---------------------------------------------------------------------------
+
+def _gaussian_kernel(size: int = 11, sigma: float = 1.5) -> torch.Tensor:
+    coords = torch.arange(size, dtype=torch.float32) - size // 2
+    g = torch.exp(-coords.pow(2) / (2 * sigma ** 2))
+    return g / g.sum()
+
+
+@torch.no_grad()
+def _psnr_pt(img1: torch.Tensor, img2: torch.Tensor) -> float:
+    """PSNR matching 3DGS image_utils.py. Input: [0,1] NCHW float32."""
+    mse = ((img1 - img2) ** 2).reshape(img1.shape[0], -1).mean(1, keepdim=True)
+    if mse.item() == 0.0:
+        return float("inf")
+    return (20.0 * torch.log10(1.0 / torch.sqrt(mse))).item()
+
+
+@torch.no_grad()
+def _ssim_pt(img1: torch.Tensor, img2: torch.Tensor, window_size: int = 11) -> float:
+    """SSIM matching 3DGS loss_utils.py conv2d implementation. Input: [0,1] NCHW float32."""
+    ch = img1.shape[1]
+    k = _gaussian_kernel(window_size).to(img1.device)
+    win = k.unsqueeze(1).mm(k.unsqueeze(0)).unsqueeze(0).unsqueeze(0)
+    win = win.expand(ch, 1, window_size, window_size).type_as(img1)
+    pad = window_size // 2
+
+    mu1 = F.conv2d(img1, win, padding=pad, groups=ch)
+    mu2 = F.conv2d(img2, win, padding=pad, groups=ch)
+    mu1_sq, mu2_sq, mu1_mu2 = mu1.pow(2), mu2.pow(2), mu1 * mu2
+
+    s1 = F.conv2d(img1 * img1, win, padding=pad, groups=ch) - mu1_sq
+    s2 = F.conv2d(img2 * img2, win, padding=pad, groups=ch) - mu2_sq
+    s12 = F.conv2d(img1 * img2, win, padding=pad, groups=ch) - mu1_mu2
+
+    C1, C2 = 0.01 ** 2, 0.03 ** 2
+    ssim_map = ((2 * mu1_mu2 + C1) * (2 * s12 + C2)) / \
+               ((mu1_sq + mu2_sq + C1) * (s1 + s2 + C2))
+    return ssim_map.mean().item()
+
+
+# ---------------------------------------------------------------------------
 # Metric computation
 # ---------------------------------------------------------------------------
 
-def compute_metrics(
-    ref: np.ndarray,
-    tgt: np.ndarray,
-    lpips_model: lpips.LPIPS,
-    device: torch.device,
-    lpips_lock: threading.Lock | None = None,
-) -> dict:
+def compute_metrics(ref, tgt, lpips_model, device, lpips_lock=None):
     """Return dict with PSNR, SSIM, LPIPS for a (ref, tgt) pair.
 
-    Follows the convention used in the 3D Gaussian Splatting evaluation script:
-    - PSNR / SSIM: computed on the raw pixel value range (data_range = ref.max())
-    - SSIM: 11x11 Gaussian kernel (gaussian_weights=True) matching the 3DGS custom SSIM
-    - LPIPS: net='vgg', input normalised to [0, 1] and passed directly
-      (same convention as the reference; no gamma conversion, no [-1,1] remapping)
+    All three metrics use the same normalised [0,1] tensor, so GPU acceleration
+    applies to PSNR and SSIM as well. Matches the 3DGS evaluation convention:
+    - PSNR: 20*log10(1/sqrt(MSE)) on [0,1] input  (image_utils.py)
+    - SSIM: 11x11 Gaussian conv2d, C1=0.01^2, C2=0.03^2  (loss_utils.py)
+    - LPIPS: net='vgg', [0,1] input, no normalize flag  (metrics.py)
 
-    lpips_lock: when running inside a thread pool, pass a shared Lock so that
-    only one VGG forward pass executes at a time.  Each pass holds ~1 GB of
-    intermediate activations for a 1080p image; running N passes concurrently
-    multiplies that by N and causes OOM.
+    lpips_lock: pass a shared threading.Lock when running inside a thread pool
+    to serialise VGG forward passes and cap peak memory usage.
     """
     data_range = float(ref.max())
     if data_range == 0.0:
-        data_range = 1.0  # avoid divide-by-zero for black reference
+        data_range = 1.0
 
-    with np.errstate(divide="ignore"):
-        psnr_val = peak_signal_noise_ratio(ref, tgt, data_range=data_range)
-    if not np.isfinite(psnr_val):
-        psnr_val = float("inf")  # identical images; display as inf rather than crashing
-    ssim_val = structural_similarity(
-        ref, tgt, data_range=data_range,
-        gaussian_weights=True, sigma=1.5,  # 11x11 Gaussian kernel, matching 3DGS
-        channel_axis=2,
-    )
-
-    # Serialise the LPIPS forward pass behind the caller-supplied lock (or a
-    # no-op context when called from a single-threaded path).
+    # Build shared normalised tensors once — reused for all three metrics.
     scale = data_range
+    ref_t = torch.from_numpy(
+        np.clip(ref / scale, 0.0, 1.0).astype(np.float32)
+    ).permute(2, 0, 1).unsqueeze(0).to(device)
+    tgt_t = torch.from_numpy(
+        np.clip(tgt / scale, 0.0, 1.0).astype(np.float32)
+    ).permute(2, 0, 1).unsqueeze(0).to(device)
+
+    # PSNR and SSIM — GPU-accelerated when device is CUDA, no lock needed.
+    psnr_val = _psnr_pt(ref_t, tgt_t)
+    ssim_val = _ssim_pt(ref_t, tgt_t)
+
+    # LPIPS — serialised via lock to cap peak activation memory.
     _ctx = lpips_lock if lpips_lock is not None else contextlib.nullcontext()
     with _ctx:
-        ref_t = torch.from_numpy(
-            np.clip(ref / scale, 0.0, 1.0).astype(np.float32)
-        ).permute(2, 0, 1).unsqueeze(0).to(device)
-        tgt_t = torch.from_numpy(
-            np.clip(tgt / scale, 0.0, 1.0).astype(np.float32)
-        ).permute(2, 0, 1).unsqueeze(0).to(device)
         with torch.no_grad():
             lpips_val = lpips_model(ref_t, tgt_t).item()
-        del ref_t, tgt_t
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
+
+    del ref_t, tgt_t
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
     return {"PSNR": psnr_val, "SSIM": ssim_val, "LPIPS": lpips_val}
 
@@ -153,10 +184,12 @@ def main() -> None:
         print("[ERROR] No comparisons defined in config.", file=sys.stderr)
         sys.exit(1)
 
-    # Workers and torch threading: keep total threads ≈ CPU count.
+    # Workers: capped at 2. LPIPS inference is serialised (lpips_lock),
+    # so extra workers only multiply memory by loading many images at once.
+    # 2 workers is sufficient to overlap image I/O with computation.
     cpu_count = os.cpu_count() or 1
-    workers = args.workers if args.workers > 0 else max(1, cpu_count // 2)
-    torch_threads = max(1, cpu_count // workers)
+    workers = args.workers if args.workers > 0 else 2
+    torch_threads = max(1, cpu_count // 2)
     torch.set_num_threads(torch_threads)
 
     # Initialise LPIPS model (AlexNet, as it's the fastest and most standard)

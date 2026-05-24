@@ -7,7 +7,9 @@ Launch: python app.py
 
 import os
 import queue
+import sys
 import threading
+import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import tkinter as tk
@@ -360,10 +362,12 @@ class App(tk.Tk):
 
             lpips_lock = threading.Lock()  # serialise VGG inference: one pass at a time
 
-            # Workers: half of CPU count, min 1. Limit torch threads so total stays ≈ CPU count.
+            # Workers: capped at 2. LPIPS inference is serialised (lpips_lock),
+            # so extra workers only multiply memory by loading many images at once.
+            # 2 workers is sufficient to overlap image I/O with computation.
             cpu_count = os.cpu_count() or 1
-            workers = max(1, cpu_count // 2)
-            torch.set_num_threads(max(1, cpu_count // workers))
+            workers = 2
+            torch.set_num_threads(max(1, cpu_count // 2))
             q.put(("status", f"Running on {device} · {workers} workers…"))
 
             # Store only paths — images are loaded on demand inside _process_pair
@@ -374,6 +378,8 @@ class App(tk.Tk):
                 for tgt_path in entry["targets"]:
                     tasks.append((ref_path, tgt_path))
 
+            print(f"[INFO] {len(tasks)} task(s) queued", flush=True)
+
             model = self._lpips_model
 
             def _process_pair(task: tuple):
@@ -381,15 +387,23 @@ class App(tk.Tk):
                 try:
                     ref_img = load_image(ref_path)
                 except Exception as e:
+                    print(f"[WARN] load ref failed: {e}", file=sys.stderr)
                     return ("warn", str(e))
                 try:
                     tgt_img = load_image(tgt_path)
                 except Exception as e:
+                    print(f"[WARN] load tgt failed: {e}", file=sys.stderr)
                     return ("warn", str(e))
                 if ref_img.shape != tgt_img.shape:
                     return ("warn", f"Shape mismatch — skipped: {Path(tgt_path).name}")
-                metrics = compute_metrics(ref_img, tgt_img, model, device, lpips_lock)
+                try:
+                    metrics = compute_metrics(ref_img, tgt_img, model, device, lpips_lock)
+                except Exception as e:
+                    msg = f"Metric error ({Path(tgt_path).name}): {e}"
+                    print(f"[ERROR] {msg}\n{traceback.format_exc()}", file=sys.stderr, flush=True)
+                    return ("warn", msg)
                 del ref_img, tgt_img
+                print(f"[OK] {Path(ref_path).name} vs {Path(tgt_path).name}", flush=True)
                 return ("result", {
                     "ref": Path(ref_path).name,
                     "target": Path(tgt_path).name,
@@ -405,7 +419,9 @@ class App(tk.Tk):
                     q.put((kind, data))
                     q.put(("tick", None))
         except Exception as e:
-            q.put(("warn", f"Worker error: {e}"))
+            msg = f"Worker error: {e}"
+            print(f"[ERROR] {msg}\n{traceback.format_exc()}", file=sys.stderr)
+            q.put(("warn", msg))
         finally:
             q.put(("done", None))
 
