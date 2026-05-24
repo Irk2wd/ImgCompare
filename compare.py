@@ -9,8 +9,10 @@ Usage:
 """
 
 import argparse
+import contextlib
 import os
 import sys
+import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -71,6 +73,7 @@ def compute_metrics(
     tgt: np.ndarray,
     lpips_model: lpips.LPIPS,
     device: torch.device,
+    lpips_lock: threading.Lock | None = None,
 ) -> dict:
     """Return dict with PSNR, SSIM, LPIPS for a (ref, tgt) pair.
 
@@ -79,28 +82,42 @@ def compute_metrics(
     - SSIM: 11x11 Gaussian kernel (gaussian_weights=True) matching the 3DGS custom SSIM
     - LPIPS: net='vgg', input normalised to [0, 1] and passed directly
       (same convention as the reference; no gamma conversion, no [-1,1] remapping)
+
+    lpips_lock: when running inside a thread pool, pass a shared Lock so that
+    only one VGG forward pass executes at a time.  Each pass holds ~1 GB of
+    intermediate activations for a 1080p image; running N passes concurrently
+    multiplies that by N and causes OOM.
     """
     data_range = float(ref.max())
     if data_range == 0.0:
         data_range = 1.0  # avoid divide-by-zero for black reference
 
-    psnr_val = peak_signal_noise_ratio(ref, tgt, data_range=data_range)
+    with np.errstate(divide="ignore"):
+        psnr_val = peak_signal_noise_ratio(ref, tgt, data_range=data_range)
+    if not np.isfinite(psnr_val):
+        psnr_val = float("inf")  # identical images; display as inf rather than crashing
     ssim_val = structural_similarity(
         ref, tgt, data_range=data_range,
         gaussian_weights=True, sigma=1.5,  # 11x11 Gaussian kernel, matching 3DGS
         channel_axis=2,
     )
 
-    # LPIPS: normalise to [0, 1] and pass directly — consistent with 3DGS / NeRF community.
+    # Serialise the LPIPS forward pass behind the caller-supplied lock (or a
+    # no-op context when called from a single-threaded path).
     scale = data_range
-    ref_t = torch.from_numpy(
-        np.clip(ref / scale, 0.0, 1.0).astype(np.float32)
-    ).permute(2, 0, 1).unsqueeze(0).to(device)
-    tgt_t = torch.from_numpy(
-        np.clip(tgt / scale, 0.0, 1.0).astype(np.float32)
-    ).permute(2, 0, 1).unsqueeze(0).to(device)
-    with torch.no_grad():
-        lpips_val = lpips_model(ref_t, tgt_t).item()
+    _ctx = lpips_lock if lpips_lock is not None else contextlib.nullcontext()
+    with _ctx:
+        ref_t = torch.from_numpy(
+            np.clip(ref / scale, 0.0, 1.0).astype(np.float32)
+        ).permute(2, 0, 1).unsqueeze(0).to(device)
+        tgt_t = torch.from_numpy(
+            np.clip(tgt / scale, 0.0, 1.0).astype(np.float32)
+        ).permute(2, 0, 1).unsqueeze(0).to(device)
+        with torch.no_grad():
+            lpips_val = lpips_model(ref_t, tgt_t).item()
+        del ref_t, tgt_t
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
     return {"PSNR": psnr_val, "SSIM": ssim_val, "LPIPS": lpips_val}
 
@@ -149,8 +166,10 @@ def main() -> None:
     print("[INFO] Loading LPIPS model (vgg)...")
     lpips_model = lpips.LPIPS(net="vgg").to(device)
     lpips_model.eval()
+    lpips_lock = threading.Lock()  # serialise VGG inference: one pass at a time
 
-    # Build flat list of (ref_img, ref_path, tgt_path) tasks.
+    # Build flat list of (ref_path, tgt_path) tasks — images are loaded on demand
+    # inside the worker to avoid keeping all refs in memory simultaneously.
     tasks: list[tuple] = []
     for entry in comparisons:
         ref_path = entry.get("ref", "")
@@ -158,16 +177,16 @@ def main() -> None:
         if not ref_path or not targets:
             print(f"[WARN] Skipping incomplete entry: {entry}")
             continue
+        for tgt_path in targets:
+            tasks.append((ref_path, tgt_path))
+
+    def _process_pair(task: tuple) -> dict | None:
+        ref_path, tgt_path = task
         try:
             ref_img = load_image(ref_path)
         except FileNotFoundError as e:
-            print(f"[WARN] {e} — skipping all targets for this ref.")
-            continue
-        for tgt_path in targets:
-            tasks.append((ref_img, ref_path, tgt_path))
-
-    def _process_pair(task: tuple) -> dict | None:
-        ref_img, ref_path, tgt_path = task
+            print(f"[WARN] {e}")
+            return None
         try:
             tgt_img = load_image(tgt_path)
         except FileNotFoundError as e:
@@ -179,7 +198,7 @@ def main() -> None:
                 f"({tgt_path}) — skipping."
             )
             return None
-        metrics = compute_metrics(ref_img, tgt_img, lpips_model, device)
+        metrics = compute_metrics(ref_img, tgt_img, lpips_model, device, lpips_lock)
         print(
             f"  {Path(ref_path).name} vs {Path(tgt_path).name}  "
             f"PSNR={metrics['PSNR']:.2f}  "

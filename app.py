@@ -351,57 +351,63 @@ class App(tk.Tk):
 
     def _worker(self, comparisons: list[dict]):
         q = self._result_queue
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        if self._lpips_model is None:
-            self._lpips_model = lpips.LPIPS(net="vgg").to(device)
-            self._lpips_model.eval()
-            self._lpips_device = device
+        try:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            if self._lpips_model is None:
+                self._lpips_model = lpips.LPIPS(net="vgg").to(device)
+                self._lpips_model.eval()
+                self._lpips_device = device
 
-        # Workers: half of CPU count, min 1. Limit torch threads so total stays ≈ CPU count.
-        cpu_count = os.cpu_count() or 1
-        workers = max(1, cpu_count // 2)
-        torch.set_num_threads(max(1, cpu_count // workers))
-        q.put(("status", f"Running on {device} · {workers} workers…"))
+            lpips_lock = threading.Lock()  # serialise VGG inference: one pass at a time
 
-        # Build flat task list (load refs once per group).
-        tasks: list[tuple] = []
-        for entry in comparisons:
-            ref_path = entry["ref"]
-            try:
-                ref_img = load_image(ref_path)
-            except Exception as e:
-                q.put(("warn", str(e)))
-                continue
-            for tgt_path in entry["targets"]:
-                tasks.append((ref_img, ref_path, tgt_path))
+            # Workers: half of CPU count, min 1. Limit torch threads so total stays ≈ CPU count.
+            cpu_count = os.cpu_count() or 1
+            workers = max(1, cpu_count // 2)
+            torch.set_num_threads(max(1, cpu_count // workers))
+            q.put(("status", f"Running on {device} · {workers} workers…"))
 
-        model = self._lpips_model
+            # Store only paths — images are loaded on demand inside _process_pair
+            # to avoid keeping all ref/target arrays in memory simultaneously.
+            tasks: list[tuple] = []
+            for entry in comparisons:
+                ref_path = entry["ref"]
+                for tgt_path in entry["targets"]:
+                    tasks.append((ref_path, tgt_path))
 
-        def _process_pair(task: tuple):
-            ref_img, ref_path, tgt_path = task
-            try:
-                tgt_img = load_image(tgt_path)
-            except Exception as e:
-                return ("warn", str(e))
-            if ref_img.shape != tgt_img.shape:
-                return ("warn", f"Shape mismatch — skipped: {Path(tgt_path).name}")
-            metrics = compute_metrics(ref_img, tgt_img, model, device)
-            return ("result", {
-                "ref": Path(ref_path).name,
-                "target": Path(tgt_path).name,
-                "ref_path": ref_path,
-                "target_path": tgt_path,
-                **metrics,
-            })
+            model = self._lpips_model
 
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(_process_pair, t): t for t in tasks}
-            for fut in as_completed(futures):
-                kind, data = fut.result()
-                q.put((kind, data))
-                q.put(("tick", None))
+            def _process_pair(task: tuple):
+                ref_path, tgt_path = task
+                try:
+                    ref_img = load_image(ref_path)
+                except Exception as e:
+                    return ("warn", str(e))
+                try:
+                    tgt_img = load_image(tgt_path)
+                except Exception as e:
+                    return ("warn", str(e))
+                if ref_img.shape != tgt_img.shape:
+                    return ("warn", f"Shape mismatch — skipped: {Path(tgt_path).name}")
+                metrics = compute_metrics(ref_img, tgt_img, model, device, lpips_lock)
+                del ref_img, tgt_img
+                return ("result", {
+                    "ref": Path(ref_path).name,
+                    "target": Path(tgt_path).name,
+                    "ref_path": ref_path,
+                    "target_path": tgt_path,
+                    **metrics,
+                })
 
-        q.put(("done", None))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {pool.submit(_process_pair, t): t for t in tasks}
+                for fut in as_completed(futures):
+                    kind, data = fut.result()
+                    q.put((kind, data))
+                    q.put(("tick", None))
+        except Exception as e:
+            q.put(("warn", f"Worker error: {e}"))
+        finally:
+            q.put(("done", None))
 
     def _poll_queue(self):
         try:
