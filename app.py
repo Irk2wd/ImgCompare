@@ -24,11 +24,41 @@ import pandas as pd
 import torch
 import yaml
 
-from compare import compute_metrics, load_image, safe_clear_cuda_cache
+from compare import METRIC_NAMES, compute_metrics, load_image, safe_clear_cuda_cache
 
-ACCELERATED_MODE = "Accelerated (GPU/threads)"
-SINGLE_TASK_MODE = "Single task (CPU)"
+ACCELERATED_MODE = "Accelerated (GPU/threads, auto fp16)"
+SINGLE_TASK_GPU_MODE = "Single task (GPU)"
+CONSERVATIVE_CPU_MODE = "Conservative (CPU)"
 LARGE_IMAGE_MODE_PIXELS = 3000 * 3000
+
+RUN_MODE_DETAILS = {
+    ACCELERATED_MODE: {
+        "label": "Accelerated",
+        "description": (
+            "2 workers. Prefer CUDA. LPIPS auto-switches to fp16 for large images or after GPU OOM. "
+            "Fastest mode, with the highest GPU memory pressure."
+        ),
+    },
+    SINGLE_TASK_GPU_MODE: {
+        "label": "Single task GPU",
+        "description": (
+            "1 worker. Prefer CUDA. LPIPS still auto-switches to fp16 when needed. "
+            "Slower than Accelerated, but uses less concurrent GPU memory."
+        ),
+    },
+    CONSERVATIVE_CPU_MODE: {
+        "label": "Conservative CPU",
+        "description": (
+            "1 worker on CPU only. No CUDA dependency. Slowest mode, but the most conservative fallback path."
+        ),
+    },
+}
+
+METRIC_DETAILS = {
+    "PSNR": "Pixel error metric. Fast and cheap.",
+    "SSIM": "Structure metric. Slightly heavier than PSNR.",
+    "LPIPS": "Perceptual metric. Slowest and most memory-hungry.",
+}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -180,9 +210,16 @@ class App(tk.Tk):
         self._results: list[dict] = []
         self._result_queue: queue.Queue = queue.Queue()
         self._run_mode_var = tk.StringVar(value=ACCELERATED_MODE)
+        self._mode_help_var = tk.StringVar()
+        self._metric_vars = {
+            metric: tk.BooleanVar(value=True) for metric in METRIC_NAMES
+        }
+        self._metric_buttons: list[ttk.Checkbutton] = []
         self._running = False
 
         self._build_ui()
+        self._run_mode_var.trace_add("write", self._update_mode_help)
+        self._update_mode_help()
 
     # ── UI construction ──────────────────────────────────────
 
@@ -233,36 +270,81 @@ class App(tk.Tk):
         bottom = tk.Frame(self)
         bottom.pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=6)
 
+        action_row = tk.Frame(bottom)
+        action_row.pack(fill=tk.X)
+
+        options_row = tk.Frame(bottom)
+        options_row.pack(fill=tk.X, pady=(6, 0))
+
+        status_row = tk.Frame(bottom)
+        status_row.pack(fill=tk.X, pady=(6, 0))
+
         self._run_btn = tk.Button(
-            bottom, text="▶  Run Comparison", command=self._run,
+            action_row, text="▶  Run Comparison", command=self._run,
             bg="#4CAF50", fg="white", activebackground="#45a049",
             width=18, relief=tk.FLAT, padx=6,
         )
         self._run_btn.pack(side=tk.LEFT, padx=(0, 8))
 
-        mode_frame = tk.Frame(bottom)
-        mode_frame.pack(side=tk.LEFT, padx=(0, 8))
-        tk.Label(mode_frame, text="Mode:").pack(side=tk.LEFT, padx=(0, 4))
-        self._mode_combo = ttk.Combobox(
-            mode_frame,
-            textvariable=self._run_mode_var,
-            values=(ACCELERATED_MODE, SINGLE_TASK_MODE),
-            state="readonly",
-            width=24,
-        )
-        self._mode_combo.pack(side=tk.LEFT)
-
         self._export_btn = tk.Button(
-            bottom, text="Export CSV", command=self._export_csv, state=tk.DISABLED
+            action_row, text="Export CSV", command=self._export_csv, state=tk.DISABLED
         )
         self._export_btn.pack(side=tk.LEFT, padx=(0, 8))
 
-        self._progress = ttk.Progressbar(bottom, mode="determinate", length=180)
+        self._progress = ttk.Progressbar(action_row, mode="determinate", length=180)
         self._progress.pack(side=tk.RIGHT)
 
+        mode_frame = tk.LabelFrame(options_row, text="Run Mode", padx=8, pady=6)
+        mode_frame.pack(fill=tk.X)
+        mode_row = tk.Frame(mode_frame)
+        mode_row.pack(anchor=tk.W)
+        self._mode_combo = ttk.Combobox(
+            mode_row,
+            textvariable=self._run_mode_var,
+            values=(ACCELERATED_MODE, SINGLE_TASK_GPU_MODE, CONSERVATIVE_CPU_MODE),
+            state="readonly",
+            width=38,
+        )
+        self._mode_combo.pack(side=tk.LEFT)
+        tk.Label(
+            mode_frame,
+            textvariable=self._mode_help_var,
+            anchor=tk.W,
+            justify=tk.LEFT,
+            fg="#555555",
+            wraplength=420,
+        ).pack(anchor=tk.W, pady=(2, 0))
+
+        metrics_frame = tk.LabelFrame(options_row, text="Metrics", padx=8, pady=6)
+        metrics_frame.pack(fill=tk.X, pady=(6, 0))
+        metrics_row = tk.Frame(metrics_frame)
+        metrics_row.pack(anchor=tk.W)
+        metric_help_text = (
+            "Choose any combination. At least one metric is required.\n"
+            + "  ".join(
+                f"{metric}: {METRIC_DETAILS[metric]}" for metric in METRIC_NAMES
+            )
+        )
+        for metric in METRIC_NAMES:
+            button = ttk.Checkbutton(
+                metrics_row,
+                text=metric,
+                variable=self._metric_vars[metric],
+            )
+            button.pack(anchor=tk.W)
+            self._metric_buttons.append(button)
+        tk.Label(
+            metrics_frame,
+            text=metric_help_text,
+            anchor=tk.W,
+            justify=tk.LEFT,
+            fg="#555555",
+            wraplength=320,
+        ).pack(anchor=tk.W, pady=(2, 0))
+
         self._status_var = tk.StringVar(value="Ready.")
-        tk.Label(bottom, textvariable=self._status_var, anchor=tk.W).pack(
-            side=tk.LEFT, padx=4
+        tk.Label(status_row, textvariable=self._status_var, anchor=tk.W).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=4
         )
 
     # ── Group management ─────────────────────────────────────
@@ -274,6 +356,24 @@ class App(tk.Tk):
             g.set_data(data)
         self._groups.append(g)
         self._scroll.scroll_to_bottom()
+
+    def _update_mode_help(self, *_args):
+        details = RUN_MODE_DETAILS.get(self._run_mode_var.get())
+        if details is None:
+            self._mode_help_var.set("")
+            return
+        self._mode_help_var.set(details["description"])
+
+    def _get_selected_metrics(self) -> tuple[str, ...]:
+        return tuple(
+            metric for metric in METRIC_NAMES if self._metric_vars[metric].get()
+        )
+
+    @staticmethod
+    def _format_metric_value(value, digits: int) -> str:
+        if value is None or pd.isna(value):
+            return ""
+        return f"{value:.{digits}f}"
 
     def _remove_group(self, group: GroupWidget):
         group.destroy()
@@ -327,7 +427,10 @@ class App(tk.Tk):
         )
         if not path:
             return
-        df = pd.DataFrame(self._results, columns=["ref", "target", "ref_path", "target_path", "PSNR", "SSIM", "LPIPS"])
+        df = pd.DataFrame(
+            self._results,
+            columns=["ref", "target", "ref_path", "target_path", *METRIC_NAMES],
+        )
         df.to_csv(path, index=False)
         self._status_var.set(f"Exported → {Path(path).name}")
 
@@ -354,6 +457,13 @@ class App(tk.Tk):
                 "Nothing to run", "Add at least one group with a ref image and targets."
             )
             return
+        selected_metrics = self._get_selected_metrics()
+        if not selected_metrics:
+            messagebox.showwarning(
+                "No metrics selected",
+                "Select at least one metric before starting the run.",
+            )
+            return
 
         total = sum(len(c["targets"]) for c in comparisons)
         self._progress.configure(maximum=total, value=0)
@@ -363,24 +473,34 @@ class App(tk.Tk):
         self._export_btn.configure(state=tk.DISABLED)
         self._run_btn.configure(state=tk.DISABLED)
         self._mode_combo.configure(state=tk.DISABLED)
+        for button in self._metric_buttons:
+            button.configure(state=tk.DISABLED)
         self._running = True
         run_mode = self._run_mode_var.get()
-        mode_label = "accelerated" if run_mode == ACCELERATED_MODE else "single-task"
-        self._status_var.set(f"Loading LPIPS model ({mode_label})…")
+        mode_label = RUN_MODE_DETAILS.get(run_mode, RUN_MODE_DETAILS[ACCELERATED_MODE])["label"]
+        metric_label = ", ".join(selected_metrics)
+        self._status_var.set(f"Preparing {metric_label} ({mode_label})…")
 
         threading.Thread(
-            target=self._worker, args=(comparisons, run_mode), daemon=True
+            target=self._worker,
+            args=(comparisons, run_mode, selected_metrics),
+            daemon=True,
         ).start()
         self.after(100, self._poll_queue)
 
-    def _worker(self, comparisons: list[dict], run_mode: str):
+    def _worker(self, comparisons: list[dict], run_mode: str, selected_metrics: tuple[str, ...]):
         q = self._result_queue
         try:
+            mode_details = RUN_MODE_DETAILS.get(run_mode, RUN_MODE_DETAILS[ACCELERATED_MODE])
             accelerated_mode = run_mode == ACCELERATED_MODE
+            cpu_only_mode = run_mode == CONSERVATIVE_CPU_MODE
+            gpu_mode = run_mode in (ACCELERATED_MODE, SINGLE_TASK_GPU_MODE)
+            needs_lpips = "LPIPS" in selected_metrics
+            metric_label = ", ".join(selected_metrics)
             device = torch.device(
-                "cuda" if accelerated_mode and torch.cuda.is_available() else "cpu"
+                "cuda" if gpu_mode and torch.cuda.is_available() else "cpu"
             )
-            mode_name = "Accelerated" if accelerated_mode else "Single task"
+            mode_name = mode_details["label"]
 
             lpips_lock = threading.Lock()
             cpu_model_lock = threading.Lock()
@@ -390,7 +510,7 @@ class App(tk.Tk):
 
             cpu_count = os.cpu_count() or 1
             workers = 2 if accelerated_mode else 1
-            torch_threads = max(1, cpu_count // 2) if accelerated_mode else 1
+            torch_threads = max(1, cpu_count // 2) if gpu_mode else 1
             torch.set_num_threads(torch_threads)
 
             tasks: list[tuple[int, str, str]] = []
@@ -401,7 +521,7 @@ class App(tk.Tk):
 
             total_tasks = len(tasks)
             prefer_gpu_fp16 = False
-            if accelerated_mode and device.type == "cuda" and tasks:
+            if needs_lpips and gpu_mode and device.type == "cuda" and tasks:
                 sample_ref_path = tasks[0][1]
                 try:
                     sample_ref = load_image(sample_ref_path)
@@ -421,25 +541,30 @@ class App(tk.Tk):
                         flush=True,
                     )
 
-            print(f"[INFO] Loading LPIPS model ({mode_name})", flush=True)
-            primary_model = lpips.LPIPS(net="vgg").to(device)
+            print(f"[INFO] Preparing metrics ({mode_name}): {metric_label}", flush=True)
+            primary_model = None
             lpips_half_model = None
             lpips_cpu_model = None
-            if prefer_gpu_fp16 and device.type == "cuda":
-                primary_model = primary_model.half()
-                gpu_fp16_fallback.set()
-                lpips_half_model = primary_model
-            primary_model.eval()
+            if needs_lpips:
+                print(f"[INFO] Loading LPIPS model ({mode_name})", flush=True)
+                primary_model = lpips.LPIPS(net="vgg").to(device)
+                if prefer_gpu_fp16 and device.type == "cuda":
+                    primary_model = primary_model.half()
+                    gpu_fp16_fallback.set()
+                    lpips_half_model = primary_model
+                primary_model.eval()
 
             q.put((
                 "status",
-                f"Running {mode_name} on {device} | {workers} worker(s) | {total_tasks} pair(s) queued",
+                f"Running {mode_name} on {device} | metrics: {metric_label} | {workers} worker(s) | {total_tasks} pair(s) queued",
             ))
             print(f"[INFO] Running {mode_name} on {device} with {workers} worker(s)", flush=True)
             print(f"[INFO] {total_tasks} task(s) queued", flush=True)
 
             def _get_cpu_model():
                 nonlocal lpips_cpu_model
+                if not needs_lpips:
+                    return None
                 with cpu_model_lock:
                     if lpips_cpu_model is None:
                         if device.type == "cpu":
@@ -452,6 +577,8 @@ class App(tk.Tk):
 
             def _get_gpu_half_model():
                 nonlocal lpips_half_model, lpips_cpu_model, primary_model
+                if not needs_lpips:
+                    return None
                 with model_init_lock:
                     if lpips_half_model is None:
                         if primary_model is not None and device.type == "cuda":
@@ -469,7 +596,7 @@ class App(tk.Tk):
                 return lpips_half_model
 
             def _select_run_mode():
-                if not accelerated_mode:
+                if cpu_only_mode:
                     return _get_cpu_model(), torch.device("cpu"), torch.float32, "cpu"
                 if cpu_fallback.is_set():
                     return _get_cpu_model(), torch.device("cpu"), torch.float32, "cpu"
@@ -502,6 +629,7 @@ class App(tk.Tk):
                         _get_cpu_model(),
                         torch.device("cpu"),
                         lpips_lock,
+                        selected_metrics=selected_metrics,
                     )
 
                 pair_start = time.perf_counter()
@@ -536,7 +664,7 @@ class App(tk.Tk):
                 try:
                     run_model, run_device, lpips_dtype, run_label = _select_run_mode()
                     _stage(
-                        f"Computing metrics on {run_label} after load {ref_load_elapsed + tgt_load_elapsed:.2f}s"
+                        f"Computing {metric_label} on {run_label} after load {ref_load_elapsed + tgt_load_elapsed:.2f}s"
                     )
                     metrics_start = time.perf_counter()
                     try:
@@ -547,6 +675,7 @@ class App(tk.Tk):
                             run_device,
                             lpips_lock,
                             lpips_dtype=lpips_dtype,
+                            selected_metrics=selected_metrics,
                         )
                     except torch.OutOfMemoryError as e:
                         if run_device.type != "cuda":
@@ -555,7 +684,7 @@ class App(tk.Tk):
                             return ("warn", msg)
 
                         try:
-                            if lpips_dtype == torch.float32:
+                            if needs_lpips and lpips_dtype == torch.float32:
                                 gpu_fp16_fallback.set()
                                 safe_clear_cuda_cache()
                                 warn_msg = (
@@ -576,6 +705,7 @@ class App(tk.Tk):
                                         device,
                                         lpips_lock,
                                         lpips_dtype=torch.float16,
+                                        selected_metrics=selected_metrics,
                                     )
                                 except torch.OutOfMemoryError:
                                     metrics = _run_on_cpu_fallback(ref_img, tgt_img)
@@ -636,9 +766,9 @@ class App(tk.Tk):
                         values=(
                             data["ref"],
                             data["target"],
-                            f"{data['PSNR']:.2f}",
-                            f"{data['SSIM']:.4f}",
-                            f"{data['LPIPS']:.4f}",
+                            self._format_metric_value(data.get("PSNR"), 2),
+                            self._format_metric_value(data.get("SSIM"), 4),
+                            self._format_metric_value(data.get("LPIPS"), 4),
                         ),
                     )
                 elif kind == "tick":
@@ -654,6 +784,8 @@ class App(tk.Tk):
                     self._running = False
                     self._run_btn.configure(state=tk.NORMAL)
                     self._mode_combo.configure(state="readonly")
+                    for button in self._metric_buttons:
+                        button.configure(state=tk.NORMAL)
                     if self._results:
                         self._export_btn.configure(state=tk.NORMAL)
                         self._status_var.set(

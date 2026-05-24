@@ -37,6 +37,8 @@ from tabulate import tabulate
 # Suppress torchvision deprecation warnings originating from lpips internals.
 warnings.filterwarnings("ignore", category=UserWarning, module="torchvision")
 
+METRIC_NAMES = ("PSNR", "SSIM", "LPIPS")
+
 CUDA_CLEANUP_ERRORS = (
     RuntimeError,
     torch.OutOfMemoryError,
@@ -134,7 +136,32 @@ def _ssim_pt(img1: torch.Tensor, img2: torch.Tensor, window_size: int = 11) -> f
 # Metric computation
 # ---------------------------------------------------------------------------
 
-def compute_metrics(ref, tgt, lpips_model, device, lpips_lock=None, lpips_dtype: torch.dtype = torch.float32):
+def _normalize_metric_selection(selected_metrics) -> tuple[str, ...]:
+    if selected_metrics is None:
+        return METRIC_NAMES
+    if isinstance(selected_metrics, str):
+        selected_metrics = [selected_metrics]
+
+    normalized = {str(name).upper() for name in selected_metrics}
+    invalid = sorted(normalized.difference(METRIC_NAMES))
+    if invalid:
+        raise ValueError(f"Unknown metric(s): {', '.join(invalid)}")
+
+    ordered = tuple(metric for metric in METRIC_NAMES if metric in normalized)
+    if not ordered:
+        raise ValueError("At least one metric must be selected.")
+    return ordered
+
+
+def compute_metrics(
+    ref,
+    tgt,
+    lpips_model,
+    device,
+    lpips_lock=None,
+    lpips_dtype: torch.dtype = torch.float32,
+    selected_metrics=None,
+):
     """Return dict with PSNR, SSIM, LPIPS for a (ref, tgt) pair.
 
     All three metrics use the same normalised [0,1] tensor, so GPU acceleration
@@ -146,6 +173,7 @@ def compute_metrics(ref, tgt, lpips_model, device, lpips_lock=None, lpips_dtype:
     lpips_lock: pass a shared threading.Lock when running inside a thread pool
     to serialise VGG forward passes and cap peak memory usage.
     """
+    selected_metrics = _normalize_metric_selection(selected_metrics)
     data_range = float(ref.max())
     if data_range == 0.0:
         data_range = 1.0
@@ -164,6 +192,7 @@ def compute_metrics(ref, tgt, lpips_model, device, lpips_lock=None, lpips_dtype:
     ref_t = None
     tgt_t = None
     _ctx = lpips_lock if lpips_lock is not None else contextlib.nullcontext()
+    results = {metric: None for metric in METRIC_NAMES}
 
     try:
         with _ctx:
@@ -171,23 +200,28 @@ def compute_metrics(ref, tgt, lpips_model, device, lpips_lock=None, lpips_dtype:
                 ref_t = ref_cpu.to(device)
                 tgt_t = tgt_cpu.to(device)
 
-                psnr_val = _psnr_pt(ref_t, tgt_t)
-                ssim_val = _ssim_pt(ref_t, tgt_t)
-                lpips_ref = ref_t
-                lpips_tgt = tgt_t
-                if lpips_dtype != ref_t.dtype:
-                    lpips_ref = ref_t.to(dtype=lpips_dtype)
-                    lpips_tgt = tgt_t.to(dtype=lpips_dtype)
-                try:
-                    with torch.no_grad():
-                        lpips_val = lpips_model(lpips_ref, lpips_tgt).item()
-                finally:
-                    if lpips_ref is not ref_t:
-                        del lpips_ref
-                    if lpips_tgt is not tgt_t:
-                        del lpips_tgt
+                if "PSNR" in selected_metrics:
+                    results["PSNR"] = _psnr_pt(ref_t, tgt_t)
+                if "SSIM" in selected_metrics:
+                    results["SSIM"] = _ssim_pt(ref_t, tgt_t)
+                if "LPIPS" in selected_metrics:
+                    if lpips_model is None:
+                        raise ValueError("LPIPS model is required when LPIPS is selected.")
+                    lpips_ref = ref_t
+                    lpips_tgt = tgt_t
+                    if lpips_dtype != ref_t.dtype:
+                        lpips_ref = ref_t.to(dtype=lpips_dtype)
+                        lpips_tgt = tgt_t.to(dtype=lpips_dtype)
+                    try:
+                        with torch.no_grad():
+                            results["LPIPS"] = lpips_model(lpips_ref, lpips_tgt).item()
+                    finally:
+                        if lpips_ref is not ref_t:
+                            del lpips_ref
+                        if lpips_tgt is not tgt_t:
+                            del lpips_tgt
 
-                return {"PSNR": psnr_val, "SSIM": ssim_val, "LPIPS": lpips_val}
+                return results
             finally:
                 if ref_t is not None:
                     del ref_t
