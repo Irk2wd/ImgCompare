@@ -13,13 +13,15 @@ import contextlib
 import os
 import sys
 import threading
-import traceback
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 # Must be set before cv2 is imported to enable EXR support.
 os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
+# Helps large-image CUDA workloads avoid allocator fragmentation where supported.
+if os.name != "nt":
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import cv2
 import lpips
@@ -127,30 +129,40 @@ def compute_metrics(ref, tgt, lpips_model, device, lpips_lock=None):
     if data_range == 0.0:
         data_range = 1.0
 
-    # Build shared normalised tensors once — reused for all three metrics.
+    # Build normalised CPU tensors first. When a shared lock is provided, all
+    # device work below becomes single-file so only one pair occupies GPU memory
+    # at a time, while another worker can still overlap image I/O.
     scale = data_range
-    ref_t = torch.from_numpy(
+    ref_cpu = torch.from_numpy(
         np.clip(ref / scale, 0.0, 1.0).astype(np.float32)
-    ).permute(2, 0, 1).unsqueeze(0).to(device)
-    tgt_t = torch.from_numpy(
+    ).permute(2, 0, 1).unsqueeze(0)
+    tgt_cpu = torch.from_numpy(
         np.clip(tgt / scale, 0.0, 1.0).astype(np.float32)
-    ).permute(2, 0, 1).unsqueeze(0).to(device)
+    ).permute(2, 0, 1).unsqueeze(0)
 
-    # PSNR and SSIM — GPU-accelerated when device is CUDA, no lock needed.
-    psnr_val = _psnr_pt(ref_t, tgt_t)
-    ssim_val = _ssim_pt(ref_t, tgt_t)
-
-    # LPIPS — serialised via lock to cap peak activation memory.
+    ref_t = None
+    tgt_t = None
     _ctx = lpips_lock if lpips_lock is not None else contextlib.nullcontext()
-    with _ctx:
-        with torch.no_grad():
-            lpips_val = lpips_model(ref_t, tgt_t).item()
 
-    del ref_t, tgt_t
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
+    try:
+        with _ctx:
+            ref_t = ref_cpu.to(device)
+            tgt_t = tgt_cpu.to(device)
 
-    return {"PSNR": psnr_val, "SSIM": ssim_val, "LPIPS": lpips_val}
+            psnr_val = _psnr_pt(ref_t, tgt_t)
+            ssim_val = _ssim_pt(ref_t, tgt_t)
+            with torch.no_grad():
+                lpips_val = lpips_model(ref_t, tgt_t).item()
+
+        return {"PSNR": psnr_val, "SSIM": ssim_val, "LPIPS": lpips_val}
+    finally:
+        del ref_cpu, tgt_cpu
+        if ref_t is not None:
+            del ref_t
+        if tgt_t is not None:
+            del tgt_t
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
 
 # ---------------------------------------------------------------------------

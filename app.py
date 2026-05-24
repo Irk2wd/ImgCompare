@@ -9,11 +9,15 @@ import os
 import queue
 import sys
 import threading
+import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+
+if os.name != "nt":
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import lpips
 import pandas as pd
@@ -173,6 +177,7 @@ class App(tk.Tk):
         self._result_queue: queue.Queue = queue.Queue()
         self._lpips_model: lpips.LPIPS | None = None
         self._lpips_device: torch.device | None = None
+        self._lpips_cpu_model: lpips.LPIPS | None = None
         self._running = False
 
         self._build_ui()
@@ -355,12 +360,14 @@ class App(tk.Tk):
         q = self._result_queue
         try:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            if self._lpips_model is None:
+            if self._lpips_model is None or self._lpips_device != device:
                 self._lpips_model = lpips.LPIPS(net="vgg").to(device)
                 self._lpips_model.eval()
                 self._lpips_device = device
 
             lpips_lock = threading.Lock()  # serialise VGG inference: one pass at a time
+            cpu_model_lock = threading.Lock()
+            gpu_fallback = threading.Event()
 
             # Workers: capped at 2. LPIPS inference is serialised (lpips_lock),
             # so extra workers only multiply memory by loading many images at once.
@@ -368,7 +375,6 @@ class App(tk.Tk):
             cpu_count = os.cpu_count() or 1
             workers = 2
             torch.set_num_threads(max(1, cpu_count // 2))
-            q.put(("status", f"Running on {device} · {workers} workers…"))
 
             # Store only paths — images are loaded on demand inside _process_pair
             # to avoid keeping all ref/target arrays in memory simultaneously.
@@ -376,34 +382,115 @@ class App(tk.Tk):
             for entry in comparisons:
                 ref_path = entry["ref"]
                 for tgt_path in entry["targets"]:
-                    tasks.append((ref_path, tgt_path))
+                    tasks.append((len(tasks) + 1, ref_path, tgt_path))
 
-            print(f"[INFO] {len(tasks)} task(s) queued", flush=True)
+            total_tasks = len(tasks)
+            q.put(("status", f"Running on {device} | {workers} workers | {total_tasks} pair(s) queued"))
+            print(f"[INFO] Running on {device} with {workers} worker(s)", flush=True)
+            print(f"[INFO] {total_tasks} task(s) queued", flush=True)
 
             model = self._lpips_model
 
+            def _get_cpu_model():
+                with cpu_model_lock:
+                    if self._lpips_cpu_model is None:
+                        print("[INFO] Loading CPU LPIPS fallback model", flush=True)
+                        self._lpips_cpu_model = lpips.LPIPS(net="vgg").to("cpu")
+                        self._lpips_cpu_model.eval()
+                return self._lpips_cpu_model
+
             def _process_pair(task: tuple):
-                ref_path, tgt_path = task
+                pair_idx, ref_path, tgt_path = task
+                ref_name = Path(ref_path).name
+                tgt_name = Path(tgt_path).name
+
+                def _stage(message: str):
+                    status = f"[{pair_idx}/{total_tasks}] {message}: {ref_name} -> {tgt_name}"
+                    print(status, flush=True)
+                    q.put(("status", status))
+
+                pair_start = time.perf_counter()
+
+                _stage("Loading ref")
+                ref_load_start = time.perf_counter()
                 try:
                     ref_img = load_image(ref_path)
                 except Exception as e:
-                    print(f"[WARN] load ref failed: {e}", file=sys.stderr)
-                    return ("warn", str(e))
+                    msg = f"Ref load failed ({ref_name}): {e}"
+                    print(f"[WARN] [{pair_idx}/{total_tasks}] {msg}", file=sys.stderr, flush=True)
+                    return ("warn", msg)
+
+                ref_load_elapsed = time.perf_counter() - ref_load_start
+
+                _stage(f"Loading tgt after {ref_load_elapsed:.2f}s")
+                tgt_load_start = time.perf_counter()
                 try:
                     tgt_img = load_image(tgt_path)
                 except Exception as e:
-                    print(f"[WARN] load tgt failed: {e}", file=sys.stderr)
-                    return ("warn", str(e))
+                    msg = f"Target load failed ({tgt_name}): {e}"
+                    print(f"[WARN] [{pair_idx}/{total_tasks}] {msg}", file=sys.stderr, flush=True)
+                    return ("warn", msg)
+
+                tgt_load_elapsed = time.perf_counter() - tgt_load_start
+
                 if ref_img.shape != tgt_img.shape:
-                    return ("warn", f"Shape mismatch — skipped: {Path(tgt_path).name}")
+                    msg = f"Shape mismatch - skipped: {tgt_name}"
+                    print(f"[WARN] [{pair_idx}/{total_tasks}] {msg}", file=sys.stderr, flush=True)
+                    return ("warn", msg)
+
+                run_device = torch.device("cpu") if gpu_fallback.is_set() else device
+                run_model = _get_cpu_model() if run_device.type == "cpu" else model
+                run_label = "CPU fallback" if run_device.type == "cpu" and device.type == "cuda" else str(run_device)
+
+                _stage(
+                    f"Computing metrics on {run_label} after load {ref_load_elapsed + tgt_load_elapsed:.2f}s"
+                )
+                metrics_start = time.perf_counter()
                 try:
-                    metrics = compute_metrics(ref_img, tgt_img, model, device, lpips_lock)
+                    metrics = compute_metrics(ref_img, tgt_img, run_model, run_device, lpips_lock)
+                except torch.OutOfMemoryError as e:
+                    if run_device.type != "cuda":
+                        msg = f"Metric error ({tgt_name}): {e}"
+                        print(f"[ERROR] {msg}\n{traceback.format_exc()}", file=sys.stderr, flush=True)
+                        return ("warn", msg)
+
+                    gpu_fallback.set()
+                    torch.cuda.empty_cache()
+                    warn_msg = (
+                        f"CUDA OOM on {tgt_name}; retrying this and remaining pairs on CPU"
+                    )
+                    print(f"[WARN] [{pair_idx}/{total_tasks}] {warn_msg}", file=sys.stderr, flush=True)
+                    q.put(("status", warn_msg))
+                    _stage("Retrying on CPU")
+                    try:
+                        metrics = compute_metrics(
+                            ref_img,
+                            tgt_img,
+                            _get_cpu_model(),
+                            torch.device("cpu"),
+                            lpips_lock,
+                        )
+                    except Exception as retry_error:
+                        msg = f"CPU fallback error ({tgt_name}): {retry_error}"
+                        print(
+                            f"[ERROR] {msg}\n{traceback.format_exc()}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        return ("warn", msg)
                 except Exception as e:
-                    msg = f"Metric error ({Path(tgt_path).name}): {e}"
+                    msg = f"Metric error ({tgt_name}): {e}"
                     print(f"[ERROR] {msg}\n{traceback.format_exc()}", file=sys.stderr, flush=True)
                     return ("warn", msg)
+
+                metrics_elapsed = time.perf_counter() - metrics_start
+                total_elapsed = time.perf_counter() - pair_start
                 del ref_img, tgt_img
-                print(f"[OK] {Path(ref_path).name} vs {Path(tgt_path).name}", flush=True)
+                print(
+                    f"[OK] [{pair_idx}/{total_tasks}] {ref_name} vs {tgt_name} "
+                    f"| metrics {metrics_elapsed:.2f}s | total {total_elapsed:.2f}s",
+                    flush=True,
+                )
                 return ("result", {
                     "ref": Path(ref_path).name,
                     "target": Path(tgt_path).name,
