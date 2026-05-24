@@ -26,6 +26,10 @@ import yaml
 
 from compare import compute_metrics, load_image, safe_clear_cuda_cache
 
+ACCELERATED_MODE = "Accelerated (GPU/threads)"
+SINGLE_TASK_MODE = "Single task (CPU)"
+LARGE_IMAGE_MODE_PIXELS = 3000 * 3000
+
 
 # ─────────────────────────────────────────────────────────────
 # Scrollable frame
@@ -175,9 +179,7 @@ class App(tk.Tk):
         self._groups: list[GroupWidget] = []
         self._results: list[dict] = []
         self._result_queue: queue.Queue = queue.Queue()
-        self._lpips_model: lpips.LPIPS | None = None
-        self._lpips_device: torch.device | None = None
-        self._lpips_cpu_model: lpips.LPIPS | None = None
+        self._run_mode_var = tk.StringVar(value=ACCELERATED_MODE)
         self._running = False
 
         self._build_ui()
@@ -237,6 +239,18 @@ class App(tk.Tk):
             width=18, relief=tk.FLAT, padx=6,
         )
         self._run_btn.pack(side=tk.LEFT, padx=(0, 8))
+
+        mode_frame = tk.Frame(bottom)
+        mode_frame.pack(side=tk.LEFT, padx=(0, 8))
+        tk.Label(mode_frame, text="Mode:").pack(side=tk.LEFT, padx=(0, 4))
+        self._mode_combo = ttk.Combobox(
+            mode_frame,
+            textvariable=self._run_mode_var,
+            values=(ACCELERATED_MODE, SINGLE_TASK_MODE),
+            state="readonly",
+            width=24,
+        )
+        self._mode_combo.pack(side=tk.LEFT)
 
         self._export_btn = tk.Button(
             bottom, text="Export CSV", command=self._export_csv, state=tk.DISABLED
@@ -348,58 +362,122 @@ class App(tk.Tk):
         self._results.clear()
         self._export_btn.configure(state=tk.DISABLED)
         self._run_btn.configure(state=tk.DISABLED)
+        self._mode_combo.configure(state=tk.DISABLED)
         self._running = True
-        self._status_var.set("Loading LPIPS model…")
+        run_mode = self._run_mode_var.get()
+        mode_label = "accelerated" if run_mode == ACCELERATED_MODE else "single-task"
+        self._status_var.set(f"Loading LPIPS model ({mode_label})…")
 
         threading.Thread(
-            target=self._worker, args=(comparisons,), daemon=True
+            target=self._worker, args=(comparisons, run_mode), daemon=True
         ).start()
         self.after(100, self._poll_queue)
 
-    def _worker(self, comparisons: list[dict]):
+    def _worker(self, comparisons: list[dict], run_mode: str):
         q = self._result_queue
         try:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            if self._lpips_model is None or self._lpips_device != device:
-                self._lpips_model = lpips.LPIPS(net="vgg").to(device)
-                self._lpips_model.eval()
-                self._lpips_device = device
+            accelerated_mode = run_mode == ACCELERATED_MODE
+            device = torch.device(
+                "cuda" if accelerated_mode and torch.cuda.is_available() else "cpu"
+            )
+            mode_name = "Accelerated" if accelerated_mode else "Single task"
 
-            lpips_lock = threading.Lock()  # serialise VGG inference: one pass at a time
+            lpips_lock = threading.Lock()
             cpu_model_lock = threading.Lock()
-            gpu_fallback = threading.Event()
+            model_init_lock = threading.Lock()
+            gpu_fp16_fallback = threading.Event()
+            cpu_fallback = threading.Event()
 
-            # Workers: capped at 2. LPIPS inference is serialised (lpips_lock),
-            # so extra workers only multiply memory by loading many images at once.
-            # 2 workers is sufficient to overlap image I/O with computation.
             cpu_count = os.cpu_count() or 1
-            workers = 2
-            torch.set_num_threads(max(1, cpu_count // 2))
+            workers = 2 if accelerated_mode else 1
+            torch_threads = max(1, cpu_count // 2) if accelerated_mode else 1
+            torch.set_num_threads(torch_threads)
 
-            # Store only paths — images are loaded on demand inside _process_pair
-            # to avoid keeping all ref/target arrays in memory simultaneously.
-            tasks: list[tuple] = []
+            tasks: list[tuple[int, str, str]] = []
             for entry in comparisons:
                 ref_path = entry["ref"]
                 for tgt_path in entry["targets"]:
                     tasks.append((len(tasks) + 1, ref_path, tgt_path))
 
             total_tasks = len(tasks)
-            q.put(("status", f"Running on {device} | {workers} workers | {total_tasks} pair(s) queued"))
-            print(f"[INFO] Running on {device} with {workers} worker(s)", flush=True)
+            prefer_gpu_fp16 = False
+            if accelerated_mode and device.type == "cuda" and tasks:
+                sample_ref_path = tasks[0][1]
+                try:
+                    sample_ref = load_image(sample_ref_path)
+                    pixel_count = sample_ref.shape[0] * sample_ref.shape[1]
+                    if pixel_count >= LARGE_IMAGE_MODE_PIXELS:
+                        prefer_gpu_fp16 = True
+                        print(
+                            f"[INFO] Large image mode detected ({sample_ref.shape[1]}x{sample_ref.shape[0]}); "
+                            f"starting LPIPS in cuda fp16",
+                            flush=True,
+                        )
+                    del sample_ref
+                except Exception as e:
+                    print(
+                        f"[WARN] LPIPS precision preflight failed for {sample_ref_path}: {e}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+
+            print(f"[INFO] Loading LPIPS model ({mode_name})", flush=True)
+            primary_model = lpips.LPIPS(net="vgg").to(device)
+            lpips_half_model = None
+            lpips_cpu_model = None
+            if prefer_gpu_fp16 and device.type == "cuda":
+                primary_model = primary_model.half()
+                gpu_fp16_fallback.set()
+                lpips_half_model = primary_model
+            primary_model.eval()
+
+            q.put((
+                "status",
+                f"Running {mode_name} on {device} | {workers} worker(s) | {total_tasks} pair(s) queued",
+            ))
+            print(f"[INFO] Running {mode_name} on {device} with {workers} worker(s)", flush=True)
             print(f"[INFO] {total_tasks} task(s) queued", flush=True)
 
-            model = self._lpips_model
-
             def _get_cpu_model():
+                nonlocal lpips_cpu_model
                 with cpu_model_lock:
-                    if self._lpips_cpu_model is None:
-                        print("[INFO] Loading CPU LPIPS fallback model", flush=True)
-                        self._lpips_cpu_model = lpips.LPIPS(net="vgg").to("cpu")
-                        self._lpips_cpu_model.eval()
-                return self._lpips_cpu_model
+                    if lpips_cpu_model is None:
+                        if device.type == "cpu":
+                            lpips_cpu_model = primary_model
+                        else:
+                            print("[INFO] Loading CPU LPIPS fallback model", flush=True)
+                            lpips_cpu_model = lpips.LPIPS(net="vgg").to("cpu")
+                            lpips_cpu_model.eval()
+                return lpips_cpu_model
 
-            def _process_pair(task: tuple):
+            def _get_gpu_half_model():
+                nonlocal lpips_half_model, lpips_cpu_model, primary_model
+                with model_init_lock:
+                    if lpips_half_model is None:
+                        if primary_model is not None and device.type == "cuda":
+                            print(
+                                "[INFO] Moving GUI LPIPS fp32 model to CPU before loading cuda fp16 fallback",
+                                flush=True,
+                            )
+                            lpips_cpu_model = primary_model.to("cpu")
+                            lpips_cpu_model.eval()
+                            primary_model = None
+                            safe_clear_cuda_cache()
+                        print("[INFO] Loading GUI LPIPS fallback model (cuda fp16)", flush=True)
+                        lpips_half_model = lpips.LPIPS(net="vgg").to(device).half()
+                        lpips_half_model.eval()
+                return lpips_half_model
+
+            def _select_run_mode():
+                if not accelerated_mode:
+                    return _get_cpu_model(), torch.device("cpu"), torch.float32, "cpu"
+                if cpu_fallback.is_set():
+                    return _get_cpu_model(), torch.device("cpu"), torch.float32, "cpu"
+                if device.type == "cuda" and gpu_fp16_fallback.is_set():
+                    return _get_gpu_half_model(), device, torch.float16, "cuda fp16"
+                return primary_model, device, torch.float32, str(device)
+
+            def _process_pair(task: tuple[int, str, str]):
                 pair_idx, ref_path, tgt_path = task
                 ref_name = Path(ref_path).name
                 tgt_name = Path(tgt_path).name
@@ -408,6 +486,23 @@ class App(tk.Tk):
                     status = f"[{pair_idx}/{total_tasks}] {message}: {ref_name} -> {tgt_name}"
                     print(status, flush=True)
                     q.put(("status", status))
+
+                def _run_on_cpu_fallback(ref_img, tgt_img):
+                    cpu_fallback.set()
+                    safe_clear_cuda_cache()
+                    warn_msg = (
+                        f"CUDA OOM on {tgt_name}; retrying this and remaining pairs on CPU"
+                    )
+                    print(f"[WARN] [{pair_idx}/{total_tasks}] {warn_msg}", file=sys.stderr, flush=True)
+                    q.put(("status", warn_msg))
+                    _stage("Retrying on CPU")
+                    return compute_metrics(
+                        ref_img,
+                        tgt_img,
+                        _get_cpu_model(),
+                        torch.device("cpu"),
+                        lpips_lock,
+                    )
 
                 pair_start = time.perf_counter()
 
@@ -438,66 +533,83 @@ class App(tk.Tk):
                     print(f"[WARN] [{pair_idx}/{total_tasks}] {msg}", file=sys.stderr, flush=True)
                     return ("warn", msg)
 
-                run_device = torch.device("cpu") if gpu_fallback.is_set() else device
-                run_model = _get_cpu_model() if run_device.type == "cpu" else model
-                run_label = "CPU fallback" if run_device.type == "cpu" and device.type == "cuda" else str(run_device)
-
-                _stage(
-                    f"Computing metrics on {run_label} after load {ref_load_elapsed + tgt_load_elapsed:.2f}s"
-                )
-                metrics_start = time.perf_counter()
                 try:
-                    metrics = compute_metrics(ref_img, tgt_img, run_model, run_device, lpips_lock)
-                except torch.OutOfMemoryError as e:
-                    if run_device.type != "cuda":
-                        msg = f"Metric error ({tgt_name}): {e}"
-                        print(f"[ERROR] {msg}\n{traceback.format_exc()}", file=sys.stderr, flush=True)
-                        return ("warn", msg)
-
-                    gpu_fallback.set()
-                    safe_clear_cuda_cache()
-                    warn_msg = (
-                        f"CUDA OOM on {tgt_name}; retrying this and remaining pairs on CPU"
+                    run_model, run_device, lpips_dtype, run_label = _select_run_mode()
+                    _stage(
+                        f"Computing metrics on {run_label} after load {ref_load_elapsed + tgt_load_elapsed:.2f}s"
                     )
-                    print(f"[WARN] [{pair_idx}/{total_tasks}] {warn_msg}", file=sys.stderr, flush=True)
-                    q.put(("status", warn_msg))
-                    _stage("Retrying on CPU")
+                    metrics_start = time.perf_counter()
                     try:
                         metrics = compute_metrics(
                             ref_img,
                             tgt_img,
-                            _get_cpu_model(),
-                            torch.device("cpu"),
+                            run_model,
+                            run_device,
                             lpips_lock,
+                            lpips_dtype=lpips_dtype,
                         )
-                    except Exception as retry_error:
-                        msg = f"CPU fallback error ({tgt_name}): {retry_error}"
-                        print(
-                            f"[ERROR] {msg}\n{traceback.format_exc()}",
-                            file=sys.stderr,
-                            flush=True,
-                        )
-                        return ("warn", msg)
-                except Exception as e:
-                    msg = f"Metric error ({tgt_name}): {e}"
-                    print(f"[ERROR] {msg}\n{traceback.format_exc()}", file=sys.stderr, flush=True)
-                    return ("warn", msg)
+                    except torch.OutOfMemoryError as e:
+                        if run_device.type != "cuda":
+                            msg = f"Metric error ({tgt_name}): {e}"
+                            print(f"[ERROR] {msg}\n{traceback.format_exc()}", file=sys.stderr, flush=True)
+                            return ("warn", msg)
 
-                metrics_elapsed = time.perf_counter() - metrics_start
-                total_elapsed = time.perf_counter() - pair_start
-                del ref_img, tgt_img
-                print(
-                    f"[OK] [{pair_idx}/{total_tasks}] {ref_name} vs {tgt_name} "
-                    f"| metrics {metrics_elapsed:.2f}s | total {total_elapsed:.2f}s",
-                    flush=True,
-                )
-                return ("result", {
-                    "ref": Path(ref_path).name,
-                    "target": Path(tgt_path).name,
-                    "ref_path": ref_path,
-                    "target_path": tgt_path,
-                    **metrics,
-                })
+                        try:
+                            if lpips_dtype == torch.float32:
+                                gpu_fp16_fallback.set()
+                                safe_clear_cuda_cache()
+                                warn_msg = (
+                                    f"CUDA OOM on {tgt_name}; retrying this and remaining pairs with LPIPS fp16 on GPU"
+                                )
+                                print(
+                                    f"[WARN] [{pair_idx}/{total_tasks}] {warn_msg}",
+                                    file=sys.stderr,
+                                    flush=True,
+                                )
+                                q.put(("status", warn_msg))
+                                _stage("Retrying with LPIPS fp16")
+                                try:
+                                    metrics = compute_metrics(
+                                        ref_img,
+                                        tgt_img,
+                                        _get_gpu_half_model(),
+                                        device,
+                                        lpips_lock,
+                                        lpips_dtype=torch.float16,
+                                    )
+                                except torch.OutOfMemoryError:
+                                    metrics = _run_on_cpu_fallback(ref_img, tgt_img)
+                            else:
+                                metrics = _run_on_cpu_fallback(ref_img, tgt_img)
+                        except Exception as retry_error:
+                            msg = f"Fallback error ({tgt_name}): {retry_error}"
+                            print(
+                                f"[ERROR] {msg}\n{traceback.format_exc()}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                            return ("warn", msg)
+                    except Exception as e:
+                        msg = f"Metric error ({tgt_name}): {e}"
+                        print(f"[ERROR] {msg}\n{traceback.format_exc()}", file=sys.stderr, flush=True)
+                        return ("warn", msg)
+
+                    metrics_elapsed = time.perf_counter() - metrics_start
+                    total_elapsed = time.perf_counter() - pair_start
+                    print(
+                        f"[OK] [{pair_idx}/{total_tasks}] {ref_name} vs {tgt_name} "
+                        f"| metrics {metrics_elapsed:.2f}s | total {total_elapsed:.2f}s",
+                        flush=True,
+                    )
+                    return ("result", {
+                        "ref": ref_name,
+                        "target": tgt_name,
+                        "ref_path": ref_path,
+                        "target_path": tgt_path,
+                        **metrics,
+                    })
+                finally:
+                    del ref_img, tgt_img
 
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 futures = {pool.submit(_process_pair, t): t for t in tasks}
@@ -507,7 +619,7 @@ class App(tk.Tk):
                     q.put(("tick", None))
         except Exception as e:
             msg = f"Worker error: {e}"
-            print(f"[ERROR] {msg}\n{traceback.format_exc()}", file=sys.stderr)
+            print(f"[ERROR] {msg}\n{traceback.format_exc()}", file=sys.stderr, flush=True)
             q.put(("warn", msg))
         finally:
             q.put(("done", None))
@@ -541,6 +653,7 @@ class App(tk.Tk):
                 elif kind == "done":
                     self._running = False
                     self._run_btn.configure(state=tk.NORMAL)
+                    self._mode_combo.configure(state="readonly")
                     if self._results:
                         self._export_btn.configure(state=tk.NORMAL)
                         self._status_var.set(
