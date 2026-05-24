@@ -215,6 +215,10 @@ class App(tk.Tk):
             metric: tk.BooleanVar(value=True) for metric in METRIC_NAMES
         }
         self._metric_buttons: list[ttk.Checkbutton] = []
+        self._stop_requested = threading.Event()
+        self._pause_requested = threading.Event()
+        self._pause_gate = threading.Event()
+        self._pause_gate.set()
         self._running = False
 
         self._build_ui()
@@ -285,6 +289,34 @@ class App(tk.Tk):
             width=18, relief=tk.FLAT, padx=6,
         )
         self._run_btn.pack(side=tk.LEFT, padx=(0, 8))
+
+        self._pause_btn = tk.Button(
+            action_row,
+            text="Pause",
+            command=self._toggle_pause,
+            bg="#F0AD4E",
+            fg="white",
+            activebackground="#EC971F",
+            width=10,
+            relief=tk.FLAT,
+            padx=6,
+            state=tk.DISABLED,
+        )
+        self._pause_btn.pack(side=tk.LEFT, padx=(0, 8))
+
+        self._stop_btn = tk.Button(
+            action_row,
+            text="Stop",
+            command=self._request_stop,
+            bg="#D9534F",
+            fg="white",
+            activebackground="#C9302C",
+            width=10,
+            relief=tk.FLAT,
+            padx=6,
+            state=tk.DISABLED,
+        )
+        self._stop_btn.pack(side=tk.LEFT, padx=(0, 8))
 
         self._export_btn = tk.Button(
             action_row, text="Export CSV", command=self._export_csv, state=tk.DISABLED
@@ -445,6 +477,31 @@ class App(tk.Tk):
         for index, (_, k) in enumerate(items):
             self._tree.move(k, "", index)
 
+    def _request_stop(self):
+        if not self._running or self._stop_requested.is_set():
+            return
+        self._stop_requested.set()
+        self._pause_gate.set()
+        self._pause_btn.configure(state=tk.DISABLED, text="Pause")
+        self._stop_btn.configure(state=tk.DISABLED)
+        self._status_var.set("Stop requested. Waiting for in-flight pair(s) to finish…")
+
+    def _toggle_pause(self):
+        if not self._running or self._stop_requested.is_set():
+            return
+        if self._pause_requested.is_set():
+            self._pause_requested.clear()
+            self._pause_gate.set()
+            self._pause_btn.configure(text="Pause")
+            self._status_var.set("Resuming…")
+        else:
+            self._pause_requested.set()
+            self._pause_gate.clear()
+            self._pause_btn.configure(text="Resume")
+            self._status_var.set(
+                "Pause requested. Waiting for in-flight pair(s) to reach a safe point…"
+            )
+
     # ── Run / worker thread ───────────────────────────────────
 
     def _run(self):
@@ -472,6 +529,11 @@ class App(tk.Tk):
         self._results.clear()
         self._export_btn.configure(state=tk.DISABLED)
         self._run_btn.configure(state=tk.DISABLED)
+        self._stop_requested.clear()
+        self._pause_requested.clear()
+        self._pause_gate.set()
+        self._pause_btn.configure(state=tk.NORMAL, text="Pause")
+        self._stop_btn.configure(state=tk.NORMAL)
         self._mode_combo.configure(state=tk.DISABLED)
         for button in self._metric_buttons:
             button.configure(state=tk.DISABLED)
@@ -491,6 +553,9 @@ class App(tk.Tk):
     def _worker(self, comparisons: list[dict], run_mode: str, selected_metrics: tuple[str, ...]):
         q = self._result_queue
         try:
+            stop_requested = self._stop_requested
+            pause_requested = self._pause_requested
+            pause_gate = self._pause_gate
             mode_details = RUN_MODE_DETAILS.get(run_mode, RUN_MODE_DETAILS[ACCELERATED_MODE])
             accelerated_mode = run_mode == ACCELERATED_MODE
             cpu_only_mode = run_mode == CONSERVATIVE_CPU_MODE
@@ -501,6 +566,8 @@ class App(tk.Tk):
                 "cuda" if gpu_mode and torch.cuda.is_available() else "cpu"
             )
             mode_name = mode_details["label"]
+            pause_status_lock = threading.Lock()
+            pause_status_sent = threading.Event()
 
             lpips_lock = threading.Lock()
             cpu_model_lock = threading.Lock()
@@ -604,10 +671,26 @@ class App(tk.Tk):
                     return _get_gpu_half_model(), device, torch.float16, "cuda fp16"
                 return primary_model, device, torch.float32, str(device)
 
+            def _wait_if_paused() -> bool:
+                while pause_requested.is_set() and not stop_requested.is_set():
+                    with pause_status_lock:
+                        if not pause_status_sent.is_set():
+                            pause_status_sent.set()
+                            q.put(("paused", None))
+                            print("[INFO] Pause active. Waiting for resume...", flush=True)
+                    pause_gate.wait(timeout=0.1)
+                with pause_status_lock:
+                    if pause_status_sent.is_set() and not pause_requested.is_set():
+                        pause_status_sent.clear()
+                return stop_requested.is_set()
+
             def _process_pair(task: tuple[int, str, str]):
                 pair_idx, ref_path, tgt_path = task
                 ref_name = Path(ref_path).name
                 tgt_name = Path(tgt_path).name
+
+                if _wait_if_paused():
+                    return ("stopped", None)
 
                 def _stage(message: str):
                     status = f"[{pair_idx}/{total_tasks}] {message}: {ref_name} -> {tgt_name}"
@@ -644,6 +727,8 @@ class App(tk.Tk):
                     return ("warn", msg)
 
                 ref_load_elapsed = time.perf_counter() - ref_load_start
+                if _wait_if_paused():
+                    return ("stopped", None)
 
                 _stage(f"Loading tgt after {ref_load_elapsed:.2f}s")
                 tgt_load_start = time.perf_counter()
@@ -655,6 +740,8 @@ class App(tk.Tk):
                     return ("warn", msg)
 
                 tgt_load_elapsed = time.perf_counter() - tgt_load_start
+                if _wait_if_paused():
+                    return ("stopped", None)
 
                 if ref_img.shape != tgt_img.shape:
                     msg = f"Shape mismatch - skipped: {tgt_name}"
@@ -663,6 +750,8 @@ class App(tk.Tk):
 
                 try:
                     run_model, run_device, lpips_dtype, run_label = _select_run_mode()
+                    if _wait_if_paused():
+                        return ("stopped", None)
                     _stage(
                         f"Computing {metric_label} on {run_label} after load {ref_load_elapsed + tgt_load_elapsed:.2f}s"
                     )
@@ -682,6 +771,9 @@ class App(tk.Tk):
                             msg = f"Metric error ({tgt_name}): {e}"
                             print(f"[ERROR] {msg}\n{traceback.format_exc()}", file=sys.stderr, flush=True)
                             return ("warn", msg)
+
+                        if stop_requested.is_set():
+                            return ("stopped", None)
 
                         try:
                             if needs_lpips and lpips_dtype == torch.float32:
@@ -745,6 +837,8 @@ class App(tk.Tk):
                 futures = {pool.submit(_process_pair, t): t for t in tasks}
                 for fut in as_completed(futures):
                     kind, data = fut.result()
+                    if kind == "stopped":
+                        continue
                     q.put((kind, data))
                     q.put(("tick", None))
         except Exception as e:
@@ -778,15 +872,34 @@ class App(tk.Tk):
                     self._status_var.set(f"Processing… {done}/{total}")
                 elif kind == "status":
                     self._status_var.set(data)
+                elif kind == "paused":
+                    done = int(self._progress["value"])
+                    total = int(self._progress["maximum"])
+                    self._status_var.set(
+                        f"Paused — {done}/{total} pair(s) completed. Click Resume to continue."
+                    )
                 elif kind == "warn":
                     self._status_var.set(f"⚠ {data}")
                 elif kind == "done":
                     self._running = False
+                    stopped = self._stop_requested.is_set()
                     self._run_btn.configure(state=tk.NORMAL)
+                    self._pause_btn.configure(state=tk.DISABLED, text="Pause")
+                    self._stop_btn.configure(state=tk.DISABLED)
                     self._mode_combo.configure(state="readonly")
                     for button in self._metric_buttons:
                         button.configure(state=tk.NORMAL)
-                    if self._results:
+                    self._pause_requested.clear()
+                    self._pause_gate.set()
+                    self._stop_requested.clear()
+                    if stopped:
+                        total = int(self._progress["maximum"])
+                        if self._results:
+                            self._export_btn.configure(state=tk.NORMAL)
+                        self._status_var.set(
+                            f"Stopped — {len(self._results)}/{total} pair(s) completed."
+                        )
+                    elif self._results:
                         self._export_btn.configure(state=tk.NORMAL)
                         self._status_var.set(
                             f"Done — {len(self._results)} pair(s) computed."
