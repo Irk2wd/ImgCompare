@@ -1,0 +1,13 @@
+# Example config for ExrCompare
+# Each entry specifies one reference image and a list of images to compare against it.
+
+comparisons:
+  - ref: D:/renders/ref/scene1.exr
+    targets:
+      - D:/renders/methodA/scene1.exr
+      - D:/renders/methodB/scene1.exr
+
+  - ref: D:/renders/ref/scene2.exr
+    targets:
+      - D:/renders/methodA/scene2.exr
+      - D:/renders/methodB/scene2.exr

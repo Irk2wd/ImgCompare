@@ -1,0 +1,8 @@
+opencv-python-headless
+scikit-image
+lpips
+torch
+torchvision
+pyyaml
+pandas
+tabulate
