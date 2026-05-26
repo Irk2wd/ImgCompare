@@ -15,7 +15,7 @@ Results are therefore directly comparable with numbers reported in NeRF / 3DGS p
 ## Requirements
 
 - Python 3.10+
-- PyTorch (CPU or CUDA) — install separately from [pytorch.org](https://pytorch.org/get-started/locally/) if GPU support is needed
+- NVIDIA GPU with driver ≥ 570 (CUDA 12.8) for GPU acceleration — CPU-only fallback is supported
 
 ## Installation
 
@@ -28,6 +28,13 @@ source .venv/bin/activate
 
 pip install -r requirements.txt
 ```
+
+> **GPU note**: `requirements.txt` defaults to `torch==2.11.0+cu128` (CUDA 12.8).  
+> If you don't have an NVIDIA GPU, replace the last two lines of `requirements.txt` with just `torch` and `torchvision` before installing, or run:
+> ```bash
+> pip install opencv-python-headless lpips pyyaml pandas tabulate torch torchvision
+> ```
+> The app will automatically use CPU when CUDA is unavailable.
 
 > **EXR support**: `opencv-python-headless` is used instead of `opencv-python`.  
 > The `OPENCV_IO_ENABLE_OPENEXR=1` environment variable is set automatically by the scripts.

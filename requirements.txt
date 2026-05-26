@@ -1,9 +1,11 @@
 opencv-python-headless
 lpips
-# Install the CUDA build manually:
-# pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
-torch
-torchvision
 pyyaml
 pandas
 tabulate
+# GPU build (CUDA 12.8, requires NVIDIA driver >= 570).
+# pip will find the +cu128 wheels via the extra index below.
+# CPU-only fallback: replace the two lines below with just `torch` and `torchvision`.
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.11.0+cu128
+torchvision==0.26.0+cu128
